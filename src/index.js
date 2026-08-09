@@ -1,7 +1,9 @@
 /**
- * Cloudflare Workers MVP — Command Code → OpenAI/Anthropic 兼容代理
+ * Cloudflare Workers — Command Code → OpenAI/Anthropic 兼容代理
  * Ephemeral 内存状态（isolate 级 Map，冷启动会重置 session/fingerprint）
- * 协议逻辑来自 proxy.mjs
+ *
+ * Credit: protocol & proxy logic adapted from
+ *   https://github.com/MAXeaglet/commandcode-proxy (MIT, © MAXeaglet)
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 

@@ -6,6 +6,16 @@ Command Code API → OpenAI / Anthropic 兼容代理，运行在 **Cloudflare Wo
 - 配置：`wrangler.toml` + secrets / env
 - 状态：isolate 内 ephemeral `Map`（冷启动会重置 session / fingerprint）
 
+## Credits
+
+本项目基于 [MAXeaglet/commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) 的协议实现与代理逻辑，移植并裁剪为 Cloudflare Workers 部署形态。
+
+- 原仓库：https://github.com/MAXeaglet/commandcode-proxy  
+- 原作者：[@MAXeaglet](https://github.com/MAXeaglet)  
+- 原项目 License：MIT（见本仓库 `LICENSE`）
+
+感谢原作者开源的 Command Code → OpenAI/Anthropic 兼容代理。
+
 ## 功能
 
 OpenAI Chat Completions · Anthropic Messages · 流式/非流式 · tool_use · 多模态图片 · reasoning_effort · 动态模型列表 · 设备指纹伪装 · 零输出 / 超时 → 429
@@ -82,4 +92,4 @@ npm run tail      # 线上日志
 
 ## License
 
-MIT
+MIT — 版权声明见 `LICENSE`（保留原作者 [MAXeaglet](https://github.com/MAXeaglet) 版权）。
