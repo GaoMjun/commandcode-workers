@@ -1,18 +1,15 @@
 {
-  "name": "commandcode-proxy",
+  "name": "commandcode-workers",
   "version": "1.0.0",
   "type": "module",
-  "description": "Command Code → OpenAI 兼容代理",
+  "private": true,
+  "description": "Command Code → OpenAI/Anthropic compatible proxy on Cloudflare Workers",
   "license": "MIT",
-  "main": "proxy.mjs",
   "scripts": {
-    "start": "node proxy.mjs",
-    "dev": "node --watch proxy.mjs",
-    "docker:build": "docker build -t commandcode-proxy:latest .",
-    "docker:build:multi": "docker buildx build --platform linux/amd64,linux/arm64 -t commandcode-proxy:latest .",
-    "worker:dev": "wrangler dev",
-    "worker:deploy": "wrangler deploy",
-    "worker:tail": "wrangler tail"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "start": "wrangler dev"
   },
   "engines": {
     "node": ">=18.0.0"
