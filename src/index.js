@@ -1,53 +1,28 @@
 /**
- * Command Code → OpenAI 兼容代理
- * 基于真实 CLI 流量抓包数据构建
+ * Cloudflare Workers MVP — Command Code → OpenAI/Anthropic 兼容代理
+ * Ephemeral 内存状态（isolate 级 Map，冷启动会重置 session/fingerprint）
+ * 协议逻辑来自 proxy.mjs
  */
-import http from 'http';
-import crypto from 'crypto';
-import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
-// ── 配置加载 ──────────────────────────────────────
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
-function loadConfig() {
-  const defaults = {
-    port: 3000,
-    host: '0.0.0.0',
-    apiBase: 'https://api.commandcode.ai',
-    projectSlug: 'cc-proxy',
-    logFile: '',
-    logLevel: 'info',
-    useProviderModels: true,
-    modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+// ── 配置（Workers env） ───────────────────────────
+function loadConfig(env = {}) {
+  return {
+    apiBase: env.CC_API_BASE || 'https://api.commandcode.ai',
+    projectSlug: env.PROJECT_SLUG || 'cc-proxy',
+    apiKey: env.CC_API_KEY || '',
+    logLevel: env.LOG_LEVEL || 'info',
+    useProviderModels: env.CC_USE_PROVIDER_MODELS !== 'false',
+    modelRefreshIntervalMs: parseInt(env.MODEL_REFRESH_INTERVAL_MS || String(5 * 60 * 1000), 10),
   };
-
-  const configPath = resolve(__dirname, 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      const user = JSON.parse(readFileSync(configPath, 'utf-8'));
-      Object.assign(defaults, user);
-    } catch (e) {
-      console.error('[config] Failed to parse config.json:', e.message);
-    }
-  }
-
-  // 环境变量覆写
-  if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
-  if (process.env.HOST) defaults.host = process.env.HOST;
-  if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
-  if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
-  if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
-  if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
-
-  return defaults;
 }
 
-const CFG = loadConfig();
+/** @type {ReturnType<typeof loadConfig>} */
+let CFG = loadConfig();
 
-// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+
+// ── 指纹生成（per-key 内存态，Workers 冷启动会重置） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
@@ -81,8 +56,8 @@ function generateFingerprint() {
   const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
   const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
 
-  function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
-  function randHex(n) { return crypto.randomBytes(n).toString('hex'); }
+  function sha256(s) { return createHash('sha256').update(s).digest('hex'); }
+  function randHex(n) { return randomBytes(n).toString('hex'); }
 
   const macHashes = [];
   for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
@@ -137,8 +112,15 @@ async function refreshCCVersion() {
     log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
   }
 }
-refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+// Workers: no setInterval — lazy refresh on demand (see maybeRefreshCCVersion)
+let ccVersionLastFetch = 0;
+async function maybeRefreshCCVersion() {
+  const now = Date.now();
+  if (now - ccVersionLastFetch < CC_VERSION_REFRESH_MS && CC_VERSION !== CC_VERSION_FALLBACK) return;
+  ccVersionLastFetch = now;
+  await refreshCCVersion();
+}
+
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
@@ -153,9 +135,6 @@ const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 function log(level, msg, data) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
   console.log(line);
-  if (CFG.logFile) {
-    try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
-  }
 }
 
 // ── 会话管理 ───────────────────────────────────────
@@ -167,6 +146,7 @@ const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
 const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
 
 function ensureSession(apiKey) {
+  if (sessionStore.size > 100) cleanupExpiredSessions();
   const now = Date.now();
   const entry = sessionStore.get(apiKey);
 
@@ -182,19 +162,16 @@ function ensureSession(apiKey) {
   return sessionId;
 }
 
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
+// Workers: lazy cleanup on access (no setInterval)
+function cleanupExpiredSessions() {
   const now = Date.now();
-  let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
-      cleaned++;
+      keyStateStore.delete(key);
     }
   }
-  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+}
 
 function getSessionId(incomingHeaders, apiKey) {
   // 优先从客户端传来的 session 类 header 获取
@@ -264,7 +241,7 @@ async function ensureInitialized(apiKey, signal) {
         body: JSON.stringify({
           eventType: 'cli_session_exists',
           metadata: {
-            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
+            sessionId: `sess_${randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
             mode: 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
@@ -346,8 +323,8 @@ function fakeProjectSlug(sessionId) {
 }
 
 function generateTraceparent() {
-  const traceId = crypto.randomBytes(16).toString('hex');
-  const parentId = crypto.randomBytes(8).toString('hex');
+  const traceId = randomBytes(16).toString('hex');
+  const parentId = randomBytes(8).toString('hex');
   return `00-${traceId}-${parentId}-01`;
 }
 
@@ -360,7 +337,8 @@ function getDateStr() {
 }
 
 function getEnvironment() {
-  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
+  // Fake CLI environment for Workers (no real OS process)
+  return 'win32-x64, Node.js 22.0.0';
 }
 
 // ── CC 请求体构建 ─────────────────────────────────
@@ -444,7 +422,7 @@ function buildCcRequest(openaiReq) {
 
   const body = {
     config: {
-      workingDir: process.cwd(),
+      workingDir: 'C:\\Users\\dev\\projects\\cc-proxy',
       date: getDateStr(),
       environment: getEnvironment(),
       structure: [],
@@ -704,36 +682,6 @@ function mapCcError(ccStatus, ccBody) {
   return { status: mapped.status, body: { error: { message, type: mapped.type } } };
 }
 
-// ── HTTP 请求处理 ──────────────────────────────────
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalSize = 0;
-    req.on('data', c => {
-      totalSize += c.length;
-      if (totalSize > MAX_BODY_SIZE) {
-        req.destroy(new Error('Request body too large'));
-        reject(new Error('Request body exceeds 10MB limit'));
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
-      catch { reject(new Error('Invalid JSON')); }
-    });
-    req.on('error', reject);
-  });
-}
-
-function sendJSON(res, status, data) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (data && data.retry_after !== undefined) {
-    headers['Retry-After'] = String(data.retry_after);
-  }
-  res.writeHead(status, headers);
-  res.end(JSON.stringify(data));
-}
 
 function getApiKey(headers) {
   // Try Authorization: Bearer header (OpenAI SDK style)
@@ -750,8 +698,6 @@ function getApiKey(headers) {
   }
   return null;
 }
-
-// ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
   const url = `${CFG.apiBase}/alpha/generate`;
@@ -776,357 +722,6 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
   });
 
   return response;
-}
-
-// ── 路由 ────────────────────────────────────────────
-
-async function handleChatCompletions(req, res) {
-  let openaiReq;
-  try {
-    openaiReq = await readBody(req);
-  } catch {
-    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
-    return;
-  }
-
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
-    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
-    return;
-  }
-
-  const stream = openaiReq.stream === true;
-  const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
-  const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
-  const created = nowUnix();
-
-  // 构建 CC 请求体
-  const ccBody = buildCcRequest(openaiReq);
-
-  // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
-  const abortController = new AbortController();
-  let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
-  const startTime = Date.now();
-  let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0; let fullText = '';
-  let reader = null;
-  let translator = null;
-
-  try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
-
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
-      const mapped = mapCcError(ccResponse.status, errorText);
-      sendJSON(res, mapped.status, mapped.body);
-      return;
-    }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
-        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
-        : 'client-hangup';
-      abortController.signal.aborted || log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model, completionId, reason,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        keepaliveCount,
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
-        try {
-          res.write(`data: ${JSON.stringify({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-    });
-
-    if (stream) {
-      // ── 流式响应 ──
-      translator = createSseTranslator(model, completionId, created);
-      let buffer = '';
-      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
-      const decoder = new TextDecoder();
-      reader = ccResponse.body.getReader();
-      let lastKeepaliveAt = 0;
-
-      try {
-        while (true) {
-          const result = await Promise.race([
-            reader.read(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
-            ),
-          ]);
-          const { done, value } = result;
-          if (done) break;
-          if (aborted) break;
-          bytesReceived += value.length;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          let hadOutput = false;
-          for (const line of lines) {
-            const events = translator.parseLine(line);
-            if (events) {
-              if (!started) {
-                res.writeHead(200, {
-                  'Content-Type': 'text/event-stream',
-                  'Cache-Control': 'no-cache',
-                  'Connection': 'keep-alive',
-                  'X-Accel-Buffering': 'no',
-                });
-                started = true;
-                lastKeepaliveAt = Date.now();
-              }
-              for (const evt of events) res.write(evt);
-              hadOutput = true;
-            }
-            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
-          }
-          // 静默超过间隔才发 SSE comment，避免每个 silent chunk 刷屏
-          if (started && !hadOutput && Date.now() - lastKeepaliveAt >= SSE_KEEPALIVE_INTERVAL_MS) {
-            try { res.write(': keepalive\n\n'); keepaliveCount++; lastKeepaliveAt = Date.now(); } catch {}
-          }
-        }
-
-        if (!aborted) {
-          // 成功完成一次请求，重置连续超时计数
-          consecutiveTimeouts = 0;
-          // 处理剩余 buffer
-          if (buffer.trim()) {
-            const events = translator.parseLine(buffer);
-            if (events) {
-              if (!started) started = true;
-              for (const evt of events) res.write(evt);
-            }
-          }
-          // 输出 token 为 0 时记为错误，避免下游异常计费
-          if (translator.outputTokens === 0) {
-            try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-            if (!started) {
-              sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
-              return;
-            }
-            try { res.write(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`); } catch {}
-          } else {
-            if (!started) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-              });
-              started = true;
-            }
-            res.write(translator.getDoneEvent());
-          }
-        }
-      } catch (e) {
-        if (aborted) {
-          // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
-          try { reader.cancel(); } catch {}
-        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
-          log('warn', 'Stream idle timeout', {
-            path: '/v1/chat/completions',
-            model,
-            streaming: true,
-            timeoutMs: STREAM_IDLE_TIMEOUT_MS,
-            elapsedMs: Date.now() - startTime,
-            id: completionId,
-            bytesReceived,
-            lastCcEvent: lastCcEvent || '(none)',
-            inputTokens: translator.inputTokens,
-            outputTokens: translator.outputTokens,
-            cachedInputTokens: translator.cachedInputTokens,
-          });
-          try { reader.cancel(); } catch {}
-          try { abortController.abort(); } catch {} // 打断 CC 上游，避免浪费 token
-          consecutiveTimeouts++;
-          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-            ? 'Response timeout - try reducing context length (summarize earlier messages)'
-            : 'Response timeout - request timed out';
-          if (!started) {
-            sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
-            return;
-          }
-          if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
-          }
-        } else {
-          log('error', 'Stream error', { message: e.message });
-          try { abortController.abort(); } catch {} // 打断 CC 上游
-          if (!started) {
-            sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
-            return;
-          }
-          if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`); } catch {}
-          }
-        }
-      }
-
-      if (!res.writableEnded) res.end();
-    } else {
-      // ── 非流式响应（缓冲完整 NDJSON）──
-      let reasoningContent = '';
-      let finishReason = 'stop';
-      let usage = null;
-      let toolCalls = null;
-
-      reader = ccResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-
-      const processLines = () => {
-        const lines = buf.split('\n');
-        buf = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
-          try {
-            const event = JSON.parse(trimmed);
-            switch (event.type) {
-              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-              case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break;
-              case 'tool-call':
-                lastCcEvent = event.type;
-                toolCalls = toolCalls || [];
-                toolCalls.push({
-                  id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
-                  type: 'function',
-                  function: {
-                    name: event.toolName || '',
-                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                  },
-                });
-                break;
-              case 'finish':
-                lastCcEvent = event.type;
-                finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage) usage = event.totalUsage;
-                break;
-              case 'error':
-                lastCcEvent = event.type;
-                log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
-                break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-                // Silent - no user-visible content
-                break;
-              default:
-                log('warn', 'Unknown CC event type', { type: event.type });
-                break;
-            }
-          } catch {}
-        }
-      };
-
-      while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
-      }
-      processLines();
-
-      // 输出 token 为 0 时记为错误，避免下游异常计费
-      if ((usage?.outputTokens ?? 0) === 0) {
-        try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-        sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
-        return;
-      }
-
-      consecutiveTimeouts = 0;
-      sendJSON(res, 200, {
-        id: completionId,
-        object: 'chat.completion',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          message: Object.assign(
-            { role: 'assistant', content: fullText || null },
-            toolCalls ? { tool_calls: toolCalls } : {},
-            reasoningContent ? { reasoning_content: reasoningContent } : {},
-          ),
-          finish_reason: finishReason,
-        }],
-    usage: (() => {
-      if (!usage) usage = {};
-      normalizeUsage(usage);
-      return {
-        prompt_tokens: usage.inputTokens ?? 0,
-        completion_tokens: usage.outputTokens ?? 0,
-        total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-        prompt_tokens_details: { cached_tokens: usage.cachedInputTokens ?? 0 },
-      };
-    })(),
-      });
-    }
-  } catch (e) {
-    if (abortController.signal.aborted) {
-      log('warn', 'Request cancelled (client disconnected before CC response)', {
-        path: '/v1/chat/completions',
-        model,
-        completionId,
-      });
-    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
-      log('warn', 'Stream idle timeout', {
-        path: '/v1/chat/completions',
-        model,
-        streaming: false,
-        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
-        elapsedMs: Date.now() - startTime,
-        id: completionId,
-        bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        partialLen: fullText ? fullText.length : 0,
-      });
-      try { reader?.cancel(); } catch {}
-      try { abortController.abort(); } catch {} // 打断 CC 上游
-      consecutiveTimeouts++;
-      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-        ? 'Response timeout - try reducing context length (summarize earlier messages)'
-        : 'Response timeout - request timed out';
-      res.setHeader('Retry-After', '5');
-      sendJSON(res, 429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
-    } else {
-      log('error', 'Upstream error', { message: e.message });
-      try { abortController.abort(); } catch {} // 打断 CC 上游
-      sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
-    }
-  }
 }
 
 // ── Anthropic /v1/messages 协议转换 ─────────────────
@@ -1485,299 +1080,625 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   }
 }
 
-function sendAnthropicError(res, status, type, message, retryAfter) {
+
+// ── Workers helpers ──────────────────────────────────
+
+function jsonResponse(status, data, extraHeaders = {}) {
+  const headers = { 'Content-Type': 'application/json', ...extraHeaders };
+  if (data && data.retry_after !== undefined) {
+    headers['Retry-After'] = String(data.retry_after);
+  }
+  return new Response(JSON.stringify(data), { status, headers });
+}
+
+function anthropicErrorResponse(status, type, message, retryAfter) {
   const body = { type: 'error', error: { type, message } };
   const headers = { 'Content-Type': 'application/json' };
   if (retryAfter !== undefined) {
     body.retry_after = retryAfter;
     headers['Retry-After'] = String(retryAfter);
   }
-  res.writeHead(status, headers);
-  res.end(JSON.stringify(body));
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
-async function handleMessages(req, res) {
-  let anthropicReq;
-  try {
-    anthropicReq = await readBody(req);
-  } catch {
-    sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
+function sseHeaders() {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  };
+}
+
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+  };
+}
+
+function withCors(res) {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+function headerObj(request) {
+  const h = {};
+  request.headers.forEach((v, k) => { h[k.toLowerCase()] = v; });
+  // also keep original keys used by getApiKey
+  h['authorization'] = request.headers.get('authorization') || '';
+  h['Authorization'] = h['authorization'];
+  h['x-api-key'] = request.headers.get('x-api-key') || '';
+  h['X-Api-Key'] = h['x-api-key'];
+  h['x-session-id'] = request.headers.get('x-session-id') || undefined;
+  h['x-claude-code-session-id'] = request.headers.get('x-claude-code-session-id') || undefined;
+  return h;
+}
+
+async function readJson(request) {
+  const text = await request.text();
+  if (text.length > MAX_BODY_SIZE) throw new Error('Request body exceeds 10MB limit');
+  return JSON.parse(text);
+}
+
+function linkAbort(clientSignal, abortController) {
+  if (!clientSignal) return;
+  if (clientSignal.aborted) {
+    abortController.abort();
     return;
+  }
+  clientSignal.addEventListener('abort', () => {
+    try { abortController.abort(); } catch {}
+  }, { once: true });
+}
+
+// ── OpenAI Chat Completions ──────────────────────────
+
+async function handleChatCompletions(request) {
+  let openaiReq;
+  try {
+    openaiReq = await readJson(request);
+  } catch {
+    return jsonResponse(400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
   }
 
-  const apiKey = getApiKey(req.headers);
+  const headers = headerObj(request);
+  const apiKey = getApiKey(headers) || (CFG.apiKey || null);
   if (!apiKey) {
-    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
-    return;
+    return jsonResponse(401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
   }
+
+  await maybeRefreshCCVersion();
+
+  const stream = openaiReq.stream === true;
+  const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  const created = nowUnix();
+  const ccBody = buildCcRequest(openaiReq);
+
+  const abortController = new AbortController();
+  linkAbort(request.signal, abortController);
+
+  const startTime = Date.now();
+  let bytesReceived = 0;
+  let lastCcEvent = '';
+  let fullText = '';
+  let reader = null;
+
+  try {
+    await ensureInitialized(apiKey, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, headers, abortController.signal);
+
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error', { status: ccResponse.status });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      return jsonResponse(mapped.status, mapped.body);
+    }
+
+    if (stream) {
+      const translator = createSseTranslator(model, completionId, created);
+      const decoder = new TextDecoder();
+      reader = ccResponse.body.getReader();
+
+      // Buffer until first visible chunk so we can still return JSON 429/502 like Node version
+      let lineBuf = '';
+      let preEvents = [];
+      let gotVisible = false;
+      let streamError = null;
+
+      try {
+        while (!gotVisible) {
+          const result = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+            ),
+          ]);
+          const { done, value } = result;
+          if (done) break;
+          bytesReceived += value.length;
+          lineBuf += decoder.decode(value, { stream: true });
+          const lines = lineBuf.split('\n');
+          lineBuf = lines.pop() || '';
+          for (const line of lines) {
+            const events = translator.parseLine(line);
+            if (events) {
+              preEvents.push(...events);
+              gotVisible = true;
+            }
+            if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+          }
+        }
+      } catch (e) {
+        streamError = e;
+      }
+
+      if (streamError) {
+        try { reader.cancel(); } catch {}
+        try { abortController.abort(); } catch {}
+        if (streamError.message === 'STREAM_IDLE_TIMEOUT') {
+          consecutiveTimeouts++;
+          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ? 'Response timeout - try reducing context length (summarize earlier messages)'
+            : 'Response timeout - request timed out';
+          return jsonResponse(429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+        }
+        return jsonResponse(502, { error: { message: `Upstream error: ${streamError.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+      }
+
+      // Stream ended during pre-buffer with no visible output
+      if (!gotVisible) {
+        if (lineBuf.trim()) {
+          const events = translator.parseLine(lineBuf);
+          if (events) { preEvents.push(...events); gotVisible = true; }
+          lineBuf = '';
+        }
+        if (translator.outputTokens === 0 && preEvents.length === 0) {
+          try { abortController.abort(); } catch {}
+          return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+        }
+      }
+
+      const body = new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder();
+          const push = (s) => controller.enqueue(enc.encode(s));
+          try {
+            for (const evt of preEvents) push(evt);
+            let lastKeepaliveAt = Date.now();
+
+            // continue reading
+            while (true) {
+              if (abortController.signal.aborted) break;
+              const result = await Promise.race([
+                reader.read(),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+                ),
+              ]);
+              const { done, value } = result;
+              if (done) break;
+              bytesReceived += value.length;
+              lineBuf += decoder.decode(value, { stream: true });
+              const lines = lineBuf.split('\n');
+              lineBuf = lines.pop() || '';
+              let hadOutput = false;
+              for (const line of lines) {
+                const events = translator.parseLine(line);
+                if (events) {
+                  for (const evt of events) push(evt);
+                  hadOutput = true;
+                }
+                if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
+              }
+              // 仅在静默超过间隔时发 SSE comment，防止客户端超时；不再每个 silent chunk 都刷
+              if (!hadOutput && Date.now() - lastKeepaliveAt >= SSE_KEEPALIVE_INTERVAL_MS) {
+                push(': keepalive\n\n');
+                lastKeepaliveAt = Date.now();
+              }
+            }
+
+            if (lineBuf.trim()) {
+              const events = translator.parseLine(lineBuf);
+              if (events) for (const evt of events) push(evt);
+            }
+
+            if (translator.outputTokens === 0) {
+              try { abortController.abort(); } catch {}
+              push(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`);
+            } else {
+              consecutiveTimeouts = 0;
+              push(translator.getDoneEvent());
+            }
+          } catch (e) {
+            if (abortController.signal.aborted) {
+              // client gone
+            } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+              log('warn', 'Stream idle timeout', {
+                path: '/v1/chat/completions', model, streaming: true,
+                timeoutMs: STREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime,
+                id: completionId, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
+              });
+              try { abortController.abort(); } catch {}
+              consecutiveTimeouts++;
+              const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+                ? 'Response timeout - try reducing context length (summarize earlier messages)'
+                : 'Response timeout - request timed out';
+              push(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`);
+            } else {
+              log('error', 'Stream error', { message: e.message });
+              try { abortController.abort(); } catch {}
+              push(`data: ${JSON.stringify({ error: { message: e.message, type: 'proxy_error' } })}\n\n`);
+            }
+          } finally {
+            try { reader.cancel(); } catch {}
+            try { controller.close(); } catch {}
+          }
+        },
+        cancel() {
+          try { abortController.abort(); } catch {}
+          try { reader?.cancel(); } catch {}
+        },
+      });
+
+      return new Response(body, { status: 200, headers: sseHeaders() });
+    }
+
+    // ── non-stream ──
+    let reasoningContent = '';
+    let finishReason = 'stop';
+    let usage = null;
+    let toolCalls = null;
+    reader = ccResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    const processLines = () => {
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
+        try {
+          const event = JSON.parse(trimmed);
+          switch (event.type) {
+            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+            case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break;
+            case 'tool-call':
+              lastCcEvent = event.type;
+              toolCalls = toolCalls || [];
+              toolCalls.push({
+                id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
+                type: 'function',
+                function: {
+                  name: event.toolName || '',
+                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                },
+              });
+              break;
+            case 'finish':
+              lastCcEvent = event.type;
+              finishReason = mapFinishReason(event.finishReason || 'stop');
+              if (event.totalUsage) usage = event.totalUsage;
+              break;
+            case 'error':
+              lastCcEvent = event.type;
+              log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+              break;
+            case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              break;
+            default:
+              log('warn', 'Unknown CC event type', { type: event.type });
+              break;
+          }
+        } catch {}
+      }
+    };
+
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+        ),
+      ]);
+      const { done, value } = result;
+      if (done) break;
+      bytesReceived += value.length;
+      buf += decoder.decode(value, { stream: true });
+      processLines();
+    }
+    processLines();
+
+    if ((usage?.outputTokens ?? 0) === 0) {
+      try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+      return jsonResponse(429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
+    }
+
+    consecutiveTimeouts = 0;
+    if (!usage) usage = {};
+    normalizeUsage(usage);
+    return jsonResponse(200, {
+      id: completionId,
+      object: 'chat.completion',
+      created,
+      model,
+      choices: [{
+        index: 0,
+        message: Object.assign(
+          { role: 'assistant', content: fullText || null },
+          toolCalls ? { tool_calls: toolCalls } : {},
+          reasoningContent ? { reasoning_content: reasoningContent } : {},
+        ),
+        finish_reason: finishReason,
+      }],
+      usage: {
+        prompt_tokens: usage.inputTokens ?? 0,
+        completion_tokens: usage.outputTokens ?? 0,
+        total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+        prompt_tokens_details: { cached_tokens: usage.cachedInputTokens ?? 0 },
+      },
+    });
+  } catch (e) {
+    if (abortController.signal.aborted) {
+      log('warn', 'Request cancelled', { path: '/v1/chat/completions', model, completionId });
+      return jsonResponse(499, { error: { message: 'Client disconnected', type: 'cancelled' } });
+    }
+    if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      log('warn', 'Stream idle timeout', {
+        path: '/v1/chat/completions', model, streaming: false,
+        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime,
+        id: completionId, bytesReceived, lastCcEvent: lastCcEvent || '(none)',
+      });
+      try { reader?.cancel(); } catch {}
+      try { abortController.abort(); } catch {}
+      consecutiveTimeouts++;
+      const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+        ? 'Response timeout - try reducing context length (summarize earlier messages)'
+        : 'Response timeout - request timed out';
+      return jsonResponse(429, { error: { message: timeoutMsg, type: 'rate_limit_error', input_tokens: 0 }, retry_after: 5 });
+    }
+    log('error', 'Upstream error', { message: e.message });
+    try { abortController.abort(); } catch {}
+    return jsonResponse(502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+  }
+}
+
+// ── Anthropic Messages ───────────────────────────────
+
+async function handleMessages(request) {
+  let anthropicReq;
+  try {
+    anthropicReq = await readJson(request);
+  } catch {
+    return anthropicErrorResponse(400, 'invalid_request_error', 'Invalid JSON body');
+  }
+
+  const headers = headerObj(request);
+  const apiKey = getApiKey(headers) || (CFG.apiKey || null);
+  if (!apiKey) {
+    return jsonResponse(401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
+  }
+
+  await maybeRefreshCCVersion();
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
-
-  // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
 
   const abortController = new AbortController();
-  let aborted = false;
-  // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
+  linkAbort(request.signal, abortController);
+
   const startTime = Date.now();
   let messageId = '';
   let reader = null;
-  let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+  let bytesReceived = 0;
+  let lastCcEvent = '';
+  let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = await forwardToCC(ccBody, apiKey, headers, abortController.signal);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
-      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
-      return;
+      return anthropicErrorResponse(mapped.status, mapped.body.error.type, mapped.body.error.message);
     }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
-        try {
-          res.write(`event: message_delta\ndata: ${JSON.stringify({
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn' },
-            usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
-          })}\n\n`);
-          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-      log('warn', 'Client disconnected', {
-        path: '/v1/messages',
-        model,
-        messageId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-      });
-    });
 
     if (stream) {
-      // ── 流式 Anthropic SSE ──
-      let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
-      const buf = [];
+      messageId = 'msg_' + randomUUID().slice(0, 12);
+      const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
 
-      let ctx;
+      // Pre-buffer until first visible content
+      const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
+      const pre = [];
+      let gotVisible = false;
+      let genError = null;
+      let genDone = false;
+      let gen = generator[Symbol.asyncIterator]();
+
       try {
-        messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
-        const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
-        for await (const event of generator) {
-          if (aborted) break;
-          if (!started) {
-            buf.push(event);
-            // 确认有真实内容后才发 200 header
-            if (event.includes('"text_delta"') || event.includes('"tool_use"')) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-              });
-              started = true;
-              for (const ev of buf) res.write(ev);
-              buf.length = 0;
-            }
-          } else {
-            res.write(event);
-          }
-        }
-
-        if (!aborted) {
-          consecutiveTimeouts = 0;
-          if (ctx.outputTokens === 0) {
-            try { abortController.abort(); } catch {}
-            if (!started) {
-              sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
-              return;
-            }
-            for (const ev of buf) { try { res.write(ev); } catch {} }
-            buf.length = 0;
-          } else {
-            if (!started) {
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-              });
-              started = true;
-            }
-            for (const ev of buf) res.write(ev);
-            buf.length = 0;
-          }
+        while (!gotVisible) {
+          const step = await Promise.race([
+            gen.next(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+            ),
+          ]);
+          if (step.done) { genDone = true; break; }
+          const event = step.value;
+          pre.push(event);
+          if (event.includes('"text_delta"') || event.includes('"tool_use"')) gotVisible = true;
         }
       } catch (e) {
-        if (aborted) {
-          // 客户端已断连，只清理（close handler 已调用 abortController.abort()）
-        } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
-          log('warn', 'Stream idle timeout', {
-            path: '/v1/messages',
-            model,
-            streaming: true,
-            timeoutMs: STREAM_IDLE_TIMEOUT_MS,
-            elapsedMs: Date.now() - startTime,
-            id: messageId,
-            bytesReceived: ctx.bytesReceived,
-            lastCcEvent: ctx.lastCcEvent || '(none)',
-            inputTokens: ctx.inputTokens,
-            outputTokens: ctx.outputTokens,
-            cachedInputTokens: ctx.cachedInputTokens,
-          });
-          try { abortController.abort(); } catch {} // 打断 CC 上游
-          if (!started) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-              ? 'Response timeout - try reducing context length (summarize earlier messages)'
-              : 'Response timeout - request timed out';
-            sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
-            return;
-          }
-          if (!res.writableEnded) {
-            consecutiveTimeouts++;
-            const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
-              ? 'Response timeout - try reducing context length (summarize earlier messages)'
-              : 'Response timeout - request timed out';
-            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
-          }
-        } else {
-          log('error', 'Anthropic stream error', { message: e.message });
-          try { abortController.abort(); } catch {} // 打断 CC 上游
-          if (!started) {
-            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
-            return;
-          }
-          if (!res.writableEnded) {
-            try {
-              res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
-            } catch {}
-          }
+        genError = e;
+      }
+
+      if (genError) {
+        try { abortController.abort(); } catch {}
+        if (genError.message === 'STREAM_IDLE_TIMEOUT') {
+          consecutiveTimeouts++;
+          const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+            ? 'Response timeout - try reducing context length (summarize earlier messages)'
+            : 'Response timeout - request timed out';
+          return anthropicErrorResponse(429, 'rate_limit_error', timeoutMsg, 5);
+        }
+        return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${genError.message}`, 10);
+      }
+
+      if (!gotVisible && ctx.outputTokens === 0) {
+        // finished without content
+        const hasErrorEvent = pre.some(e => e.includes('"type":"error"') || e.includes('"type": "error"'));
+        if (!hasErrorEvent) {
+          try { abortController.abort(); } catch {}
+          return anthropicErrorResponse(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         }
       }
 
-      if (!res.writableEnded) res.end();
-    } else {
-      // ── 非流式 Anthropic JSON ──
-      const messageId = 'msg_' + randomUUID().slice(0, 12);
-      let finishReason = 'stop';
-      let usage = null;
-      let toolCalls = null;
-
-      reader = ccResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-
-      const processLines = () => {
-        const lines = buf.split('\n');
-        buf = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === '[DONE]') continue;
+      const body = new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder();
+          const push = (s) => controller.enqueue(enc.encode(s));
           try {
-            const event = JSON.parse(trimmed);
-            switch (event.type) {
-              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-              case 'tool-call':
-                lastCcEvent = event.type;
-                (toolCalls = toolCalls || []).push({
-                  id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
-                  type: 'function',
-                  function: {
-                    name: event.toolName || '',
-                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-                  },
-                });
-                break;
-              case 'finish':
-                lastCcEvent = event.type;
-                finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage) usage = event.totalUsage;
-                break;
-              case 'error':
-                lastCcEvent = event.type;
-                log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
-                break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-                // Silent - no user-visible content
-                break;
-              default:
-                log('warn', 'Unknown CC event type', { type: event.type });
-                break;
+            for (const ev of pre) push(ev);
+            if (!genDone) {
+              while (true) {
+                if (abortController.signal.aborted) break;
+                const step = await gen.next();
+                if (step.done) break;
+                push(step.value);
+              }
             }
-          } catch {}
-        }
-      };
+            consecutiveTimeouts = 0;
+          } catch (e) {
+            if (abortController.signal.aborted) {
+              // ignore
+            } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+              log('warn', 'Stream idle timeout', {
+                path: '/v1/messages', model, streaming: true,
+                timeoutMs: STREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime, id: messageId,
+              });
+              try { abortController.abort(); } catch {}
+              consecutiveTimeouts++;
+              const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
+                ? 'Response timeout - try reducing context length (summarize earlier messages)'
+                : 'Response timeout - request timed out';
+              push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`);
+            } else {
+              log('error', 'Anthropic stream error', { message: e.message });
+              try { abortController.abort(); } catch {}
+              push(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
+            }
+          } finally {
+            try { controller.close(); } catch {}
+          }
+        },
+        cancel() {
+          try { abortController.abort(); } catch {}
+        },
+      });
 
-      while (true) {
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
-          ),
-        ]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        buf += decoder.decode(value, { stream: true });
-        processLines();
-      }
-      processLines();
-
-      // 输出 token 为 0 时记为错误，避免下游异常计费
-      if ((usage?.outputTokens ?? 0) === 0) {
-        try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-        sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
-        return;
-      }
-
-      consecutiveTimeouts = 0;
-      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
+      return new Response(body, { status: 200, headers: sseHeaders() });
     }
+
+    // non-stream Anthropic
+    messageId = 'msg_' + randomUUID().slice(0, 12);
+    let finishReason = 'stop';
+    let usage = null;
+    let toolCalls = null;
+    reader = ccResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    const processLines = () => {
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === '[DONE]') continue;
+        try {
+          const event = JSON.parse(trimmed);
+          switch (event.type) {
+            case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
+            case 'tool-call':
+              lastCcEvent = event.type;
+              (toolCalls = toolCalls || []).push({
+                id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
+                type: 'function',
+                function: {
+                  name: event.toolName || '',
+                  arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                },
+              });
+              break;
+            case 'finish':
+              lastCcEvent = event.type;
+              finishReason = mapFinishReason(event.finishReason || 'stop');
+              if (event.totalUsage) usage = event.totalUsage;
+              break;
+            case 'error':
+              lastCcEvent = event.type;
+              log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+              break;
+            case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              break;
+            default:
+              log('warn', 'Unknown CC event type', { type: event.type });
+              break;
+          }
+        } catch {}
+      }
+    };
+
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+        ),
+      ]);
+      const { done, value } = result;
+      if (done) break;
+      bytesReceived += value.length;
+      buf += decoder.decode(value, { stream: true });
+      processLines();
+    }
+    processLines();
+
+    if ((usage?.outputTokens ?? 0) === 0) {
+      try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+      return anthropicErrorResponse(429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
+    }
+
+    consecutiveTimeouts = 0;
+    return jsonResponse(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
   } catch (e) {
     if (abortController.signal.aborted) {
-      log('warn', 'Request cancelled (client disconnected before CC response)', {
-        path: '/v1/messages',
-        model,
-        messageId,
-      });
-    } else if (e.message === 'STREAM_IDLE_TIMEOUT') {
+      log('warn', 'Request cancelled', { path: '/v1/messages', model, messageId });
+      return anthropicErrorResponse(499, 'cancelled', 'Client disconnected');
+    }
+    if (e.message === 'STREAM_IDLE_TIMEOUT') {
       log('warn', 'Stream idle timeout', {
-        path: '/v1/messages',
-        model,
-        streaming: false,
-        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS,
-        elapsedMs: Date.now() - startTime,
-        id: messageId,
-        bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        partialLen: fullText ? fullText.length : 0,
+        path: '/v1/messages', model, streaming: false,
+        timeoutMs: NONSTREAM_IDLE_TIMEOUT_MS, elapsedMs: Date.now() - startTime, id: messageId,
       });
       try { reader?.cancel(); } catch {}
-      try { abortController.abort(); } catch {} // 打断 CC 上游
+      try { abortController.abort(); } catch {}
       consecutiveTimeouts++;
       const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
         ? 'Response timeout - try reducing context length (summarize earlier messages)'
         : 'Response timeout - request timed out';
-      res.setHeader('Retry-After', '5');
-      sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
-    } else {
-      log('error', 'Upstream error', { message: e.message });
-      try { abortController.abort(); } catch {} // 打断 CC 上游
-      sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
+      return anthropicErrorResponse(429, 'rate_limit_error', timeoutMsg, 5);
     }
+    log('error', 'Upstream error', { message: e.message });
+    try { abortController.abort(); } catch {}
+    return anthropicErrorResponse(502, 'proxy_error', `Upstream error: ${e.message}`, 10);
   }
 }
 
@@ -1821,15 +1742,16 @@ async function fetchModels(apiKey) {
     log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
   }
 
-  // Fallback to hardcoded MODELS
   return MODELS;
 }
 
-async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
+async function handleModels(request) {
+  const headers = headerObj(request);
+  const apiKey = getApiKey(headers) || CFG.apiKey || null;
+  await maybeRefreshCCVersion();
   const models = await fetchModels(apiKey);
   const now = nowUnix();
-  sendJSON(res, 200, {
+  return jsonResponse(200, {
     object: 'list',
     data: models.map(m => ({
       id: m.id,
@@ -1840,63 +1762,34 @@ async function handleModels(req, res) {
   });
 }
 
-function handleHealth(req, res) {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
-}
+// ── Worker entry ─────────────────────────────────────
 
-// ── 服务器 ──────────────────────────────────────────
+export default {
+  async fetch(request, env) {
+    CFG = loadConfig(env || {});
 
-const server = http.createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-
-  try {
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      await handleChatCompletions(req, res);
-    } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      await handleMessages(req, res);
-    } else if (url.pathname === '/v1/models' && req.method === 'GET') {
-      await handleModels(req, res);
-    } else if (url.pathname === '/health' || url.pathname === '/') {
-      handleHealth(req, res);
-    } else {
-      sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
-  } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
-  }
-});
 
-// 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
-process.on('unhandledRejection', (reason) => {
-  if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
-    // 客户端断连触发的 abort — 预期行为，静默处理
-    log('info', 'Aborted request cleaned up');
-  } else {
-    log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
-  }
-});
-
-server.listen(CFG.port, CFG.host, () => {
-  log('info', 'CC Proxy started', {
-    url: `http://${CFG.host}:${CFG.port}`,
-    api: CFG.apiBase,
-    models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
-    logFile: CFG.logFile || '(console only)',
-  });
-  if (!CFG.apiKey) {
-    log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
-  }
-});
+    const url = new URL(request.url);
+    let res;
+    try {
+      if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
+        res = await handleChatCompletions(request);
+      } else if (url.pathname === '/v1/messages' && request.method === 'POST') {
+        res = await handleMessages(request);
+      } else if (url.pathname === '/v1/models' && request.method === 'GET') {
+        res = await handleModels(request);
+      } else if (url.pathname === '/health' || url.pathname === '/') {
+        res = new Response('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      } else {
+        res = jsonResponse(404, { error: { message: 'Not found', type: 'not_found' } });
+      }
+    } catch (e) {
+      log('error', 'Unhandled', { message: e.message });
+      res = jsonResponse(500, { error: { message: e.message, type: 'internal_error' } });
+    }
+    return withCors(res);
+  },
+};

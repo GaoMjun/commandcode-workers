@@ -17,6 +17,8 @@ npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:305
 npm run dev      # watch 模式（文件修改自动重启）
 ```
 
+> **Cloudflare Workers MVP**：见 [WORKERS.md](WORKERS.md)。`npm run worker:dev` / `npm run worker:deploy`。
+
 API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
 
 ```bash

@@ -17,6 +17,8 @@ npm start        # Start (the repo ships with config.json listening on http://0.
 npm run dev      # Watch mode (auto-reload on file changes)
 ```
 
+> **Cloudflare Workers MVP**: see [WORKERS.md](WORKERS.md). `npm run worker:dev` / `npm run worker:deploy`.
+
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
 
 ```bash
