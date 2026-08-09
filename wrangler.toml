@@ -9,5 +9,9 @@ CC_API_BASE = "https://api.commandcode.ai"
 PROJECT_SLUG = "cc-proxy"
 CC_USE_PROVIDER_MODELS = "true"
 
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 # Optional fallback API key (prefer per-request Authorization header):
 # npx wrangler secret put CC_API_KEY

@@ -139,6 +139,42 @@ function log(level, msg, data) {
   console.log(line);
 }
 
+/** Emit a structured usage line for wrangler tail / Logpush aggregation. */
+function logUsage({
+  path,
+  model,
+  stream = false,
+  id,
+  usage,
+  elapsedMs,
+  bytesReceived,
+  finishReason,
+  status = 'ok',
+}) {
+  const promptTokens = Number(usage?.inputTokens ?? usage?.prompt_tokens ?? 0) || 0;
+  const completionTokens = Number(usage?.outputTokens ?? usage?.completion_tokens ?? 0) || 0;
+  const cachedTokens = Number(
+    usage?.cachedInputTokens
+    ?? usage?.prompt_tokens_details?.cached_tokens
+    ?? usage?.cache_read_input_tokens
+    ?? 0,
+  ) || 0;
+  log('info', 'usage', {
+    path,
+    model,
+    stream: !!stream,
+    id: id || undefined,
+    status,
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    cached_tokens: cachedTokens,
+    total_tokens: promptTokens + completionTokens,
+    elapsed_ms: elapsedMs ?? undefined,
+    bytes_received: bytesReceived ?? undefined,
+    finish_reason: finishReason || undefined,
+  });
+}
+
 // ── 会话管理 ───────────────────────────────────────
 // 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
 // 同一 Key 在同一周期内复用，到期自动换新
@@ -1310,9 +1346,37 @@ async function handleChatCompletions(request) {
 
             if (translator.outputTokens === 0) {
               try { abortController.abort(); } catch {}
+              logUsage({
+                path: '/v1/chat/completions',
+                model,
+                stream: true,
+                id: completionId,
+                usage: {
+                  inputTokens: translator.inputTokens,
+                  outputTokens: translator.outputTokens,
+                  cachedInputTokens: translator.cachedInputTokens,
+                },
+                elapsedMs: Date.now() - startTime,
+                bytesReceived,
+                status: 'empty_output',
+              });
               push(`data: ${JSON.stringify({ error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 })}\n\n`);
             } else {
               consecutiveTimeouts = 0;
+              logUsage({
+                path: '/v1/chat/completions',
+                model,
+                stream: true,
+                id: completionId,
+                usage: {
+                  inputTokens: translator.inputTokens,
+                  outputTokens: translator.outputTokens,
+                  cachedInputTokens: translator.cachedInputTokens,
+                },
+                elapsedMs: Date.now() - startTime,
+                bytesReceived,
+                status: 'ok',
+              });
               push(translator.getDoneEvent());
             }
           } catch (e) {
@@ -1423,6 +1487,17 @@ async function handleChatCompletions(request) {
     consecutiveTimeouts = 0;
     if (!usage) usage = {};
     normalizeUsage(usage);
+    logUsage({
+      path: '/v1/chat/completions',
+      model,
+      stream: false,
+      id: completionId,
+      usage,
+      elapsedMs: Date.now() - startTime,
+      bytesReceived,
+      finishReason,
+      status: 'ok',
+    });
     return jsonResponse(200, {
       id: completionId,
       object: 'chat.completion',
@@ -1578,6 +1653,20 @@ async function handleMessages(request) {
               }
             }
             consecutiveTimeouts = 0;
+            logUsage({
+              path: '/v1/messages',
+              model,
+              stream: true,
+              id: messageId,
+              usage: {
+                inputTokens: ctx.inputTokens,
+                outputTokens: ctx.outputTokens,
+                cachedInputTokens: ctx.cachedInputTokens,
+              },
+              elapsedMs: Date.now() - startTime,
+              bytesReceived: ctx.bytesReceived,
+              status: (ctx.outputTokens ?? 0) === 0 ? 'empty_output' : 'ok',
+            });
           } catch (e) {
             if (abortController.signal.aborted) {
               // ignore
@@ -1679,6 +1768,19 @@ async function handleMessages(request) {
     }
 
     consecutiveTimeouts = 0;
+    if (!usage) usage = {};
+    normalizeUsage(usage);
+    logUsage({
+      path: '/v1/messages',
+      model,
+      stream: false,
+      id: messageId,
+      usage,
+      elapsedMs: Date.now() - startTime,
+      bytesReceived,
+      finishReason,
+      status: 'ok',
+    });
     return jsonResponse(200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
   } catch (e) {
     if (abortController.signal.aborted) {
